@@ -61,6 +61,11 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
   private final RemoteTrackRegistry<MediaStreamTrack> remoteTracks =
       new RemoteTrackRegistry<>();
   final Map<String, RtpTransceiver> transceivers = new HashMap<>();
+  // onAddTrack used to look up its transceiver with getTransceivers(), which
+  // disposes the wrappers of the previous call. A call from the platform
+  // thread at the same time disposed the wrapper onAddTrack was reading.
+  // getTransceivers() never disposes the wrapper given to onTrack.
+  private final Map<String, RtpTransceiver> receivingTransceivers = new ConcurrentHashMap<>();
   private final StateProvider stateProvider;
   private final EventChannel eventChannel;
   private EventChannel.EventSink eventSink;
@@ -107,6 +112,7 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
     peerConnection.close();
     remoteStreams.clear();
     remoteTracks.clear();
+    receivingTransceivers.clear();
     // The data channels stay registered until dispose() so that their event
     // channel handlers can be released there. Closing the peer connection
     // already closes them.
@@ -508,10 +514,24 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
 
   @Override
   public void onTrack(RtpTransceiver transceiver) {
+    RtpReceiver receiver = transceiver.getReceiver();
+    if (receiver != null) {
+      receivingTransceivers.put(receiver.id(), transceiver);
+    }
   }
 
   @Override
   public void onAddTrack(RtpReceiver receiver, MediaStream[] mediaStreams) {
+    // This runs on the signaling thread. A Java exception that gets out of a
+    // native callback aborts the app.
+    try {
+      handleAddTrack(receiver, mediaStreams);
+    } catch (RuntimeException e) {
+      Log.e(TAG, "onAddTrack failed", e);
+    }
+  }
+
+  private void handleAddTrack(RtpReceiver receiver, MediaStream[] mediaStreams) {
     Log.d(TAG, "onAddTrack");
     // for plan-b
     for (MediaStream stream : mediaStreams) {
@@ -553,16 +573,20 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
     params.putMap("receiver", rtpReceiverToMap(receiver));
 
     if (this.configuration.sdpSemantics == PeerConnection.SdpSemantics.UNIFIED_PLAN) {
-      List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
-      for (RtpTransceiver transceiver : transceivers) {
-        if (transceiver.getReceiver() != null && receiver.id().equals(transceiver.getReceiver().id())) {
+      // The Dart side accepts an onTrack event without a transceiver. Sending
+      // the event without it is better than losing the remote track.
+      try {
+        RtpTransceiver transceiver = receivingTransceivers.remove(receiver.id());
+        if (transceiver != null) {
           String transceiverId = transceiver.getMid();
           if (null == transceiverId) {
             transceiverId = stateProvider.getNextStreamUUID();
-            this.transceivers.put(transceiverId,transceiver);
+            this.transceivers.put(transceiverId, transceiver);
           }
           params.putMap("transceiver", transceiverToMap(transceiverId, transceiver));
         }
+      } catch (IllegalStateException e) {
+        Log.w(TAG, "onAddTrack: transceiver was disposed, sending the track without it", e);
       }
     }
     sendEvent(params);
@@ -570,7 +594,17 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
 
   @Override
   public void onRemoveTrack(RtpReceiver rtpReceiver) {
+    // Same reason as in onAddTrack.
+    try {
+      handleRemoveTrack(rtpReceiver);
+    } catch (RuntimeException e) {
+      Log.e(TAG, "onRemoveTrack failed", e);
+    }
+  }
+
+  private void handleRemoveTrack(RtpReceiver rtpReceiver) {
     Log.d(TAG, "onRemoveTrack");
+    receivingTransceivers.remove(rtpReceiver.id());
 
     MediaStreamTrack track = rtpReceiver.track();
     String trackId = track.id();
