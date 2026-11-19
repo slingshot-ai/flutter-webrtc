@@ -228,15 +228,24 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       }
     }
     localStreams.clear();
-    // Let a close that is still running finish before the connections are
-    // disposed underneath it. Its follow-up on the platform thread then finds
-    // the connection gone and only answers Dart.
+    // Let every close that is queued or running finish before the connections
+    // are disposed underneath it: disposing a connection while another thread
+    // is still inside its native close is unsafe. This blocks for as long as
+    // the closes take, as a synchronous close did before. Their follow-ups on
+    // the platform thread then find the connections gone and only answer Dart.
     peerConnectionCloseExecutor.shutdown();
-    try {
-      if (!peerConnectionCloseExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
-        Log.w(TAG, "dispose(): a peer connection close is still running");
+    boolean interrupted = false;
+    while (true) {
+      try {
+        if (peerConnectionCloseExecutor.awaitTermination(1, TimeUnit.SECONDS)) {
+          break;
+        }
+        Log.w(TAG, "dispose(): still waiting for a peer connection close");
+      } catch (InterruptedException e) {
+        interrupted = true;
       }
-    } catch (InterruptedException e) {
+    }
+    if (interrupted) {
       Thread.currentThread().interrupt();
     }
     synchronized (localTracks) {
