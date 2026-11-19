@@ -119,6 +119,9 @@ void postEvent(FlutterEventSink _Nullable sink, id _Nullable event) {
   BOOL _speakerOnButPreferBluetooth;
   AVAudioSessionPort _preferredInput;
   AudioManager* _audioManager;
+  // Runs -[RTCPeerConnection close] off the platform thread; see
+  // peerConnectionClose.
+  dispatch_queue_t _peerConnectionCloseQueue;
 #if TARGET_OS_IPHONE || TARGET_OS_OSX
   FlutterRTCVideoPlatformViewFactory *_platformViewFactory;
 #endif
@@ -297,6 +300,10 @@ static void FlutterWebRTCApplyFieldTrials(void) {
     _speakerOnButPreferBluetooth = NO;
     _eventChannel = eventChannel;
     _audioManager = AudioManager.sharedInstance;
+    _peerConnectionCloseQueue = dispatch_queue_create(
+        "com.cloudwebrtc.flutterwebrtc.peerConnectionClose",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+                                                QOS_CLASS_USER_INITIATED, 0));
 
 #if TARGET_OS_IPHONE
     _preferredInput = AVAudioSessionPortHeadphones;
@@ -1021,39 +1028,59 @@ static void FlutterWebRTCApplyFieldTrials(void) {
     BOOL isDispose = [@"peerConnectionDispose" isEqualToString:call.method];
 
     RTCPeerConnection* peerConnection = self.peerConnections[peerConnectionId];
-    if (peerConnection) {
-      // Closing twice is harmless, the native peer connection ignores the second call.
-      [peerConnection close];
-      peerConnection.closedByPlugin = YES;
+    if (!peerConnection) {
+      [self deactiveRtcAudioSession];
+      result(nil);
+    } else {
+      // -[RTCPeerConnection close] blocks until WebRTC's signaling and worker
+      // threads have torn the connection down. Closing the last connection also
+      // stops the audio engine, and whoever manages the audio session (LiveKit,
+      // CallKit) may deactivate it inside that stop. That can take most of a
+      // second, and on the platform thread it holds back every frame the app
+      // draws meanwhile. So the close runs on a serial queue, which also keeps a
+      // close and a later dispose of the same connection in order. Everything
+      // else here touches the plugin's own state, which only the platform thread
+      // uses, so it waits for the close and runs back there. Dart awaits the
+      // result, so nothing it does after a close sees the connection half-closed.
+      dispatch_async(_peerConnectionCloseQueue, ^{
+        // Closing twice is harmless, the native peer connection ignores the second call.
+        [peerConnection close];
 
-      // Clean up peerConnection's streams and tracks
-      [peerConnection.remoteStreams removeAllObjects];
-      [peerConnection.remoteTracks removeAllObjects];
+        dispatch_async(dispatch_get_main_queue(), ^{
+          peerConnection.closedByPlugin = YES;
 
-      // Stop delivering data channel events. There is no need to close the
-      // RTCDataChannel because it is owned by the RTCPeerConnection and the
-      // latter will close the former.
-      NSMutableDictionary<NSString*, RTCDataChannel*>* dataChannels = peerConnection.dataChannels;
-      for (NSString* dataChannelId in dataChannels) {
-        dataChannels[dataChannelId].delegate = nil;
-      }
+          // Clean up peerConnection's streams and tracks
+          [peerConnection.remoteStreams removeAllObjects];
+          [peerConnection.remoteTracks removeAllObjects];
 
-      if (isDispose) {
-        // Dart cancels its event subscriptions before it calls dispose, so this
-        // is the first point where the stream handlers can go without leaving a
-        // pending cancel unanswered. Releasing them on close would do exactly that.
-        for (NSString* dataChannelId in dataChannels) {
-          [dataChannels[dataChannelId].eventChannel setStreamHandler:nil];
-          dataChannels[dataChannelId].eventChannel = nil;
-        }
-        [dataChannels removeAllObjects];
-        [peerConnection.eventChannel setStreamHandler:nil];
-        peerConnection.eventChannel = nil;
-        [self.peerConnections removeObjectForKey:peerConnectionId];
-      }
+          // Stop delivering data channel events. There is no need to close the
+          // RTCDataChannel because it is owned by the RTCPeerConnection and the
+          // latter will close the former.
+          NSMutableDictionary<NSString*, RTCDataChannel*>* dataChannels =
+              peerConnection.dataChannels;
+          for (NSString* dataChannelId in dataChannels) {
+            dataChannels[dataChannelId].delegate = nil;
+          }
+
+          if (isDispose) {
+            // Dart cancels its event subscriptions before it calls dispose, so this
+            // is the first point where the stream handlers can go without leaving a
+            // pending cancel unanswered. Releasing them on close would do exactly that.
+            for (NSString* dataChannelId in dataChannels) {
+              [dataChannels[dataChannelId].eventChannel setStreamHandler:nil];
+              dataChannels[dataChannelId].eventChannel = nil;
+            }
+            [dataChannels removeAllObjects];
+            [peerConnection.eventChannel setStreamHandler:nil];
+            peerConnection.eventChannel = nil;
+            [self.peerConnections removeObjectForKey:peerConnectionId];
+          }
+
+          [self deactiveRtcAudioSession];
+          result(nil);
+        });
+      });
     }
-    [self deactiveRtcAudioSession];
-    result(nil);
   } else if ([@"createVideoRenderer" isEqualToString:call.method]) {
     FlutterRTCVideoRenderer* render = [self createWithTextureRegistry:_textures
                                                             messenger:_messenger];
