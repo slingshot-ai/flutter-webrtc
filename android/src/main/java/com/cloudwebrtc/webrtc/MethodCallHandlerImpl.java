@@ -95,6 +95,8 @@ import java.util.Map.Entry;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.EventChannel;
@@ -177,6 +179,13 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
   ExecutorService executor = Executors.newSingleThreadExecutor();
   Handler mainHandler = new Handler(Looper.getMainLooper());
 
+  // PeerConnection.close() blocks until WebRTC's signaling and worker threads
+  // have torn the connection down, which includes stopping its audio. On the
+  // platform thread that holds back every frame the app draws meanwhile, so
+  // closes run here instead: one at a time, in the order they were called.
+  private final ExecutorService peerConnectionCloseExecutor =
+      Executors.newSingleThreadExecutor();
+
   public static LogSink logSink = new LogSink();
 
   MethodCallHandlerImpl(Context context, BinaryMessenger messenger, TextureRegistry textureRegistry) {
@@ -219,6 +228,17 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       }
     }
     localStreams.clear();
+    // Let a close that is still running finish before the connections are
+    // disposed underneath it. Its follow-up on the platform thread then finds
+    // the connection gone and only answers Dart.
+    peerConnectionCloseExecutor.shutdown();
+    try {
+      if (!peerConnectionCloseExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
+        Log.w(TAG, "dispose(): a peer connection close is still running");
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
     synchronized (localTracks) {
       for (final LocalTrack track : localTracks.values()) {
         try {
@@ -745,14 +765,12 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       }
       case "peerConnectionClose": {
         String peerConnectionId = call.argument("peerConnectionId");
-        peerConnectionClose(peerConnectionId);
-        result.success(null);
+        peerConnectionClose(peerConnectionId, result);
         break;
       }
       case "peerConnectionDispose": {
         String peerConnectionId = call.argument("peerConnectionId");
-        peerConnectionDispose(peerConnectionId);
-        result.success(null);
+        peerConnectionDispose(peerConnectionId, result);
         break;
       }
       case "createVideoRenderer": {
@@ -2242,12 +2260,54 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     }
   }
 
-  public void peerConnectionClose(final String id) {
+  public void peerConnectionClose(final String id, final Result result) {
     PeerConnectionObserver pco = mPeerConnectionObservers.get(id);
     if (pco == null || pco.getPeerConnection() == null) {
       Log.d(TAG, "peerConnectionClose() peerConnection is null");
-    } else {
-      pco.close();
+      result.success(null);
+      return;
+    }
+    closeOffPlatformThread(id, pco, result, () -> pco.close());
+  }
+
+  public void peerConnectionDispose(final String id, final Result result) {
+    PeerConnectionObserver pco = mPeerConnectionObservers.get(id);
+    if (pco == null || pco.getPeerConnection() == null) {
+      peerConnectionDispose(id);
+      result.success(null);
+      return;
+    }
+    closeOffPlatformThread(id, pco, result, () -> peerConnectionDispose(id));
+  }
+
+  /**
+   * Closes the native connection on {@link #peerConnectionCloseExecutor}, then
+   * runs {@code thenOnPlatformThread} and answers Dart back on the platform
+   * thread. The follow-up only touches the plugin's own state; by then the
+   * close it repeats is a no-op. Dart awaits the answer, so nothing it does
+   * after a close sees the connection half-closed.
+   */
+  private void closeOffPlatformThread(final String id, final PeerConnectionObserver pco,
+      final Result result, final Runnable thenOnPlatformThread) {
+    final Runnable finish = () -> {
+      // Engine teardown disposes every connection itself and clears the map.
+      if (mPeerConnectionObservers.get(id) == pco) {
+        thenOnPlatformThread.run();
+      }
+      result.success(null);
+    };
+    try {
+      peerConnectionCloseExecutor.execute(() -> {
+        try {
+          pco.closeNativeConnection();
+        } catch (RuntimeException e) {
+          Log.w(TAG, "peerConnectionClose() failed off the platform thread", e);
+        }
+        mainHandler.post(finish);
+      });
+    } catch (RejectedExecutionException e) {
+      // Shut down by engine teardown.
+      finish.run();
     }
   }
 

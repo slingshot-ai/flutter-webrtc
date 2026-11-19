@@ -108,6 +108,15 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
     peerConnection.restartIce();
   }
 
+  /**
+   * Closes only the native connection, leaving this observer's state alone.
+   * Blocks until WebRTC has torn the connection down; callable from any
+   * thread. Closing twice is harmless, the native connection ignores it.
+   */
+  void closeNativeConnection() {
+    peerConnection.close();
+  }
+
   void close() {
     peerConnection.close();
     remoteStreams.clear();
